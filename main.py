@@ -9,7 +9,6 @@ import os
 
 # 1. CONFIGURACIÓN DE LA BASE DE DATOS
 # ==========================================
-# Para usar tu MySQL cambia la URL a: "mysql+pymysql://root:root@127.0.0.1/finalbd"
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./finalbd.db")
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

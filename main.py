@@ -1,10 +1,11 @@
 from fastapi import FastAPI, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, func
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
 import os
+import pandas as pd
 
 
 # 1. CONFIGURACIÓN DE LA BASE DE DATOS
@@ -25,9 +26,6 @@ def get_db():
     finally:
         db.close()
 
-
-# 2. MODELOS SQLALCHEMY (Mapeo de tus Tablas)
-# ==========================================
 class Carrera(Base):
     __tablename__ = "Carrera"
     clave_carrera = Column(Integer, primary_key=True, index=True, autoincrement=True)
@@ -72,8 +70,7 @@ class Inscripcion(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# 3. ESQUEMAS PYDANTIC (Validación de Datos API)
-# ==========================================
+
 class CarreraSchema(BaseModel):
     nombre: str
     model_config = ConfigDict(from_attributes=True)
@@ -126,8 +123,7 @@ class InscripcionResponse(InscripcionSchema):
     id_inscripcion: int
 
 
-# 4. APLICACIÓN FASTAPI Y ENDPOINTS CRUD
-# ==========================================
+
 app = FastAPI(title="API Universidad", description="API para gestión escolar", version="1.0.0")
 
 # --- CRUD CARRERA ---
@@ -310,9 +306,7 @@ def delete_inscripcion(id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"mensaje": "Inscripcion eliminada"}
 
-# ==========================================
-# 5. ENDPOINTS DE REPORTES 
-# ==========================================
+
 @app.get("/reportes/promedio-alumnos", tags=["Reportes"])
 def reporte_promedio_alumnos(db: Session = Depends(get_db)):
     """Genera un reporte con el promedio de calificaciones por alumno (incluye los que no tienen calificaciones)."""
@@ -335,9 +329,96 @@ def reporte_alumnos_carrera(db: Session = Depends(get_db)):
     
     return [{"carrera": r.nombre, "total_alumnos": r.total_alumnos} for r in resultados]
 
-# ==========================================
-# 6. INTERFAZ GRAFICA SENCILLA 
-# ==========================================
+
+@app.get("/estadisticas/materias-filtro", tags=["Data Analytics (Pandas)"])
+def materias_con_mayor_reprobacion(db: Session = Depends(get_db)):
+    """
+    KPI: Tasa de Reprobación por Materia.
+    Identifica cuales son las materias "cuello de botella" donde los alumnos fallan mas
+    """
+    # Extraer datos con SQLAlchemy
+    query = db.query(Materia.nombre, Calificacion.calificacion)\
+              .join(Calificacion, Materia.clave_materia == Calificacion.clave_materia)
+    
+    # Cargar a Pandas DataFrame
+    df = pd.read_sql(query.statement, query.session.bind)
+    
+    if df.empty:
+        return []
+
+    # Logica
+    df['aprobado'] = df['calificacion'] >= 60
+    
+    # Agrupar por materia para sacar el total de alumnos y cuántos reprobaron
+    stats = df.groupby('nombre').agg(
+        total_alumnos=('calificacion', 'count'),
+        total_reprobados=('aprobado', lambda x: (~x).sum()) # Contar los False (reprobados)
+    ).reset_index()
+    
+    # Calcular la tasa de reprobación
+    stats['tasa_reprobacion_pct'] = (stats['total_reprobados'] / stats['total_alumnos']) * 100
+    stats['tasa_reprobacion_pct'] = stats['tasa_reprobacion_pct'].round(2)
+    
+    # Ordenar de mayor a menor reprobación (Las materias más difíciles primero)
+    stats = stats.sort_values(by='tasa_reprobacion_pct', ascending=False)
+    
+    return JSONResponse(content=stats.to_dict(orient="records"))
+
+@app.get("/estadisticas/alerta-temprana", tags=["Data Analytics (Pandas)"])
+def alerta_temprana_desercion(db: Session = Depends(get_db)):
+    """
+    KPI: Alumnos en Riesgo Crítico.
+    Detecta alumnos que tienen un promedio general bajo Y han reprobado más de 2 materias.
+    """
+    query = db.query(Alumno.nombre, Alumno.matricula_alumno, Calificacion.calificacion)\
+              .join(Calificacion, Alumno.matricula_alumno == Calificacion.matricula_alumno)
+    
+    df = pd.read_sql(query.statement, query.session.bind)
+    
+    if df.empty:
+        return []
+
+    # Calcular promedio y conteo de materias reprobadas por alumno
+    df['reprobada'] = df['calificacion'] < 60
+    
+    riesgo_df = df.groupby(['matricula_alumno', 'nombre']).agg(
+        promedio_general=('calificacion', 'mean'),
+        materias_reprobadas=('reprobada', 'sum')
+    ).reset_index()
+    
+    # Filtro de Alerta Temprana: Promedio < 70 o mas de 2 reprobadas
+    en_riesgo = riesgo_df[(riesgo_df['promedio_general'] < 70) | (riesgo_df['materias_reprobadas'] >= 2)]
+    
+    # Formatear el promedio
+    en_riesgo['promedio_general'] = en_riesgo['promedio_general'].round(2)
+    
+    # Ordenar por los casos mas graves primero (mas reprobadas)
+    en_riesgo = en_riesgo.sort_values(by=['materias_reprobadas', 'promedio_general'], ascending=[False, True])
+    
+    return JSONResponse(content=en_riesgo.to_dict(orient="records"))
+
+@app.get("/estadisticas/alumnos-fantasma", tags=["Data Analytics (Pandas)"])
+def alumnos_sin_inscripcion(db: Session = Depends(get_db)):
+    """
+    KPI: Deserción Silenciosa (Anti-Join).
+    Encuentra estudiantes registrados en el sistema que NO están inscritos a ninguna materia actualmente.
+    """
+    # Obtener todos los alumnos
+    alumnos = pd.read_sql(db.query(Alumno.matricula_alumno, Alumno.nombre).statement, db.get_bind())
+    inscripciones = pd.read_sql(db.query(Inscripcion.matricula_alumno).statement, db.get_bind())
+    
+    if alumnos.empty:
+        return []
+        
+    # Anti-Join usando isin() de Pandas
+    alumnos_fantasma = alumnos[~alumnos['matricula_alumno'].isin(inscripciones['matricula_alumno'])]
+    
+    # Agregar una etiqueta de estado
+    alumnos_fantasma = alumnos_fantasma.copy()
+    alumnos_fantasma['estado'] = "Inactivo / Posible Deserción"
+    
+    return JSONResponse(content=alumnos_fantasma.to_dict(orient="records"))
+
 @app.get("/", tags=["Frontend"])
 def get_frontend():
     html_content = """
@@ -402,6 +483,15 @@ def get_frontend():
                 <button class="btn-verde" onclick="cargarReporte('/reportes/promedio-alumnos')">Promedio de Alumnos</button>
                 <button class="btn-verde" onclick="cargarReporte('/reportes/alumnos-por-carrera')">Alumnos por Carrera</button>
             </div>
+            
+            <hr class="separador">
+
+            <h3 style="color: #c0392b;">Sistema de Alerta Temprana (Data Analytics)</h3>
+            <div style="text-align: center;">
+                <button class="btn-azul" style="background-color: #8e44ad;" onclick="cargarReporte('/estadisticas/materias-filtro')">Materias "Filtro" (Difíciles)</button>
+                <button class="btn-azul" style="background-color: #e67e22;" onclick="cargarReporte('/estadisticas/alerta-temprana')">Alumnos en Riesgo Crítico</button>
+                <button class="btn-azul" style="background-color: #d35400;" onclick="cargarReporte('/estadisticas/alumnos-fantasma')">Desercion Silenciosa</button>
+            </div>
         </div>
 
         <div id="modal">
@@ -419,7 +509,6 @@ def get_frontend():
         </div>
 
         <script>
-
             const config = {
                 'alumnos': { endpoint: '/alumnos/', pk: 'matricula_alumno', campos: ['nombre', 'semestre', 'id_carrera'] },
                 'carreras': { endpoint: '/carreras/', pk: 'clave_carrera', campos: ['nombre'] },
@@ -508,7 +597,7 @@ def get_frontend():
             }
 
             async function guardarRegistro(event) {
-                event.preventDefault(); // Evita que la página recargue
+                event.preventDefault(); 
                 
                 const conf = config[entidadActual];
                 const idRegistro = document.getElementById('id-registro').value;
@@ -533,7 +622,7 @@ def get_frontend():
 
                     if(response.ok) {
                         cerrarModal();
-                        cargarTabla(); // Recargar la tabla tras guardar
+                        cargarTabla(); 
                     } else {
                         const errorMsg = await response.json();
                         alert("Error al guardar: " + JSON.stringify(errorMsg.detail));
@@ -565,7 +654,7 @@ def get_frontend():
 
             async function cargarReporte(endpoint) {
                 document.getElementById('btn-nuevo').style.display = 'none';
-                entidadActual = null; // Quita el modo edición
+                entidadActual = null; 
                 
                 const contenedor = document.getElementById('tabla-contenedor');
                 contenedor.innerHTML = '<p style="text-align:center;">Generando reporte...</p>';
@@ -581,157 +670,6 @@ def get_frontend():
                     const llaves = Object.keys(data[0]);
                     let html = '<table><thead><tr>';
                     llaves.forEach(llave => html += `<th>${llave.toUpperCase().replace(/_/g, ' ')}</th>`);
-                    html += '</tr></thead><tbody>';
-
-                    data.forEach(fila => {
-                        html += '<tr>';
-                        llaves.forEach(llave => html += `<td>${fila[llave]}</td>`);
-                        html += '</tr>';
-                    });
-                    html += '</tbody></table>';
-                    
-                    contenedor.innerHTML = html;
-                } catch (error) {
-                    contenedor.innerHTML = `<p style="color:red; text-align:center;">Error al cargar: ${error}</p>`;
-                }
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content, status_code=200)
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="es">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Panel de Administración - Universidad</title>
-        <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; color: #333; margin: 0; padding: 20px; }
-            h1 { color: #2c3e50; text-align: center; }
-            h3 { color: #2c3e50; text-align: center; margin-top: 5px; margin-bottom: 10px; }
-            .container { max-width: 900px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-            .btn-azul { background-color: #3498db; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 14px; margin: 5px; }
-            .btn-azul:hover { background-color: #2980b9; }
-            .btn-verde { background-color: #27ae60; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 14px; margin: 5px; }
-            .btn-verde:hover { background-color: #2ecc71; }
-            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-            th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-            th { background-color: #f8f9fa; font-weight: bold; }
-            .swagger-link { display: block; text-align: center; margin-top: 30px; color: #e74c3c; text-decoration: none; font-weight: bold; }
-            .separador { border: 0; height: 1px; background: #eee; margin: 20px 0; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1> Sistema Escolar API</h1>
-            
-            <h3>Tablas </h3>
-            <div style="text-align: center;">
-                <button class="btn-azul" onclick="cargarDatos('/alumnos/')">Ver Alumnos</button>
-                <button class="btn-azul" onclick="cargarDatos('/carreras/')">Ver Carreras</button>
-                <button class="btn-azul" onclick="cargarDatos('/materias/')">Ver Materias</button>
-                <button class="btn-azul" onclick="cargarDatos('/profesores/')">Ver Profesores</button>
-            </div>
-            
-            <hr class="separador">
-            
-            <h3> Apartado de Reportes</h3>
-            <div style="text-align: center;">
-                <button class="btn-verde" onclick="cargarDatos('/reportes/promedio-alumnos')">Promedio de Todos los Alumnos</button>
-                <button class="btn-verde" onclick="cargarDatos('/reportes/alumnos-por-carrera')">Total de Alumnos por Carrera</button>
-            </div>
-            
-            <div id="tabla-contenedor"></div>
-
-            <a href="/docs" class="swagger-link" target="_blank">Abrir documentacion de FastAPI</a>
-        </div>
-
-        <script>
-            async function cargarDatos(endpoint) {
-                const contenedor = document.getElementById('tabla-contenedor');
-                contenedor.innerHTML = '<p style="text-align:center; margin-top:20px;">Cargando datos...</p>';
-                try {
-                    const response = await fetch(endpoint);
-                    const data = await response.json();
-                    
-                    if(data.length === 0) {
-                        contenedor.innerHTML = '<p style="text-align:center; margin-top:20px;">No hay registros para mostrar aún.</p>';
-                        return;
-                    }
-
-                    const llaves = Object.keys(data[0]);
-                    let html = '<table><thead><tr>';
-                    llaves.forEach(llave => html += `<th>${llave.toUpperCase().replace(/_/g, ' ')}</th>`);
-                    html += '</tr></thead><tbody>';
-
-                    data.forEach(fila => {
-                        html += '<tr>';
-                        llaves.forEach(llave => html += `<td>${fila[llave]}</td>`);
-                        html += '</tr>';
-                    });
-                    html += '</tbody></table>';
-                    
-                    contenedor.innerHTML = html;
-                } catch (error) {
-                    contenedor.innerHTML = `<p style="color:red; text-align:center; margin-top:20px;">Error al cargar los datos: ${error}</p>`;
-                }
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content, status_code=200)
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="es">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Panel de Administración - Universidad</title>
-        <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; color: #333; margin: 0; padding: 20px; }
-            h1 { color: #2c3e50; text-align: center; }
-            .container { max-width: 900px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-            button { background-color: #3498db; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 14px; margin: 5px; }
-            button:hover { background-color: #2980b9; }
-            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-            th, td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-            th { background-color: #f8f9fa; font-weight: bold; }
-            .swagger-link { display: block; text-align: center; margin-top: 20px; color: #e74c3c; text-decoration: none; font-weight: bold; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🎓 Sistema Escolar API</h1>
-            <div style="text-align: center;">
-                <button onclick="cargarDatos('/alumnos/')">Ver Alumnos</button>
-                <button onclick="cargarDatos('/carreras/')">Ver Carreras</button>
-                <button onclick="cargarDatos('/reportes/promedio-alumnos')">Reporte: Promedios</button>
-            </div>
-            
-            <div id="tabla-contenedor"></div>
-
-            <a href="/docs" class="swagger-link" target="_blank">Abrir Documentación</a>
-        </div>
-
-        <script>
-            async function cargarDatos(endpoint) {
-                const contenedor = document.getElementById('tabla-contenedor');
-                contenedor.innerHTML = '<p style="text-align:center;">Cargando datos...</p>';
-                try {
-                    const response = await fetch(endpoint);
-                    const data = await response.json();
-                    
-                    if(data.length === 0) {
-                        contenedor.innerHTML = '<p style="text-align:center;">No hay registros en esta tabla aún.</p>';
-                        return;
-                    }
-
-                    const llaves = Object.keys(data[0]);
-                    let html = '<table><thead><tr>';
-                    llaves.forEach(llave => html += `<th>${llave.toUpperCase().replace('_', ' ')}</th>`);
                     html += '</tr></thead><tbody>';
 
                     data.forEach(fila => {
